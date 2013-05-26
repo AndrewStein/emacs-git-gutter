@@ -47,13 +47,6 @@ character for signs of changes"
   :type 'string
   :group 'git-gutter)
 
-(defcustom git-gutter:update-hooks
-  '(after-save-hook after-revert-hook window-configuration-change-hook)
-  "hook points of updating gutter"
-  :type '(list (hook :tag "HookPoint")
-               (repeat :inline t (hook :tag "HookPoint")))
-  :group 'git-gutter)
-
 (defcustom git-gutter:separator-sign nil
   "Separator sign"
   :type 'string
@@ -124,16 +117,14 @@ character for signs of changes"
   :type '(repeat symbol)
   :group 'git-gutter)
 
-(defcustom git-gutter:update-threshold 1
-  "Minimal update interval for `window-configuration-change-hook'"
-  :type 'integer
-  :group 'git-gutter)
-
 (defvar git-gutter:view-diff-function 'git-gutter:view-diff-infos
   "Function of viewing changes")
 
 (defvar git-gutter:clear-function 'git-gutter:clear-diff-infos
   "Function of clear changes")
+
+(defvar git-gutter:window-config-change-function 'git-gutter:show-gutter
+  "Function to call when the buffer's local window configuration changes")
 
 (defvar git-gutter:init-function 'nil
   "Function of initialize")
@@ -152,12 +143,11 @@ character for signs of changes"
 (defvar git-gutter:toggle-flag t)
 (defvar git-gutter:force nil)
 (defvar git-gutter:diffinfos nil)
-(defvar git-gutter:last-update (make-hash-table :test 'equal))
 (defvar git-gutter:base-file-name nil)
 (defvar git-gutter:has-indirect-buffers nil)
-(defvar git-gutter:from-wcc-hook-p nil)
 
 (defvar git-gutter:popup-buffer "*git-gutter:diff*")
+(defvar git-gutter:buffers-to-reenable nil)
 
 (defmacro git-gutter:awhen (test &rest body)
   "Anaphoric when."
@@ -324,19 +314,27 @@ character for signs of changes"
 (defsubst git-gutter:hash-key ()
   (concat git-gutter:base-file-name (buffer-name)))
 
-(defun git-gutter:from-wcc-hook ()
-  (let* ((current (float-time))
-         (key (git-gutter:hash-key))
-         (last-update-time (gethash key git-gutter:last-update))
-         (git-gutter:from-wcc-hook-p t))
-    (when (or (not last-update-time)
-              (not git-gutter:update-threshold)
-              (>= current (+ git-gutter:update-threshold last-update-time)))
-      (puthash key current git-gutter:last-update)
-      (git-gutter))))
-
 (defun git-gutter:at-kill ()
   (remhash (git-gutter:hash-key) git-gutter:last-update))
+
+(defsubst git-gutter:add-local-hooks ()
+  (add-hook 'after-save-hook   'git-gutter nil t)
+  ;; The global `find-file-hook' will re-activate `git-gutter-mode' after reverting.
+  ;; Meanwhile, `git-gutter-mode' is turned off to prevent any redundant calls to
+  ;; `git-gutter'.
+  (add-hook 'before-revert-hook     'git-gutter:turn-off nil t)
+  (add-hook 'change-major-mode-hook 'git-gutter:reenable-after-major-mode-change nil t)
+  (if git-gutter:window-config-change-function
+      (add-hook 'window-configuration-change-hook
+                git-gutter:window-config-change-function nil t)))
+
+(defsubst git-gutter:remove-local-hooks ()
+  (remove-hook 'after-save-hook 'git-gutter t)
+  (remove-hook 'before-revert-hook 'git-gutter:turn-off t)
+  (remove-hook 'change-major-mode-hook 'git-gutter:reenable-after-major-mode-change t)
+  (if git-gutter:window-config-change-function
+      (remove-hook 'window-configuration-change-hook
+                   git-gutter:window-config-change-function t)))
 
 ;;;###autoload
 (define-minor-mode git-gutter-mode
@@ -357,39 +355,65 @@ character for signs of changes"
               (set (make-local-variable 'git-gutter:base-file-name) basefile)
               (set (make-local-variable 'git-gutter:toggle-flag) t)
               (make-local-variable 'git-gutter:diffinfos)
-              (dolist (hook git-gutter:update-hooks)
-                (if (eq hook 'window-configuration-change-hook)
-                    (add-hook hook 'git-gutter:from-wcc-hook nil t)
-                  (add-hook hook 'git-gutter nil t)))
-              (add-hook 'kill-buffer-hook 'git-gutter:at-kill nil t)
-              (unless global-git-gutter-mode
-                (git-gutter)))
+              (git-gutter:add-local-hooks)
+              (git-gutter))
           (when (> git-gutter:verbosity 2)
             (message "Here is not Git work tree"))
           (git-gutter-mode -1)))
-    (dolist (hook git-gutter:update-hooks)
-      (if (eq hook 'window-configuration-change-hook)
-          (remove-hook hook 'git-gutter:from-wcc-hook t)
-        (remove-hook hook 'git-gutter t)))
-    (remove-hook 'kill-buffer-hook t)
+    (git-gutter:remove-local-hooks)
     (git-gutter:clear)))
 
+(defmacro git-gutter:in-all-buffers (&rest body)
+  `(dolist (buf (buffer-list))
+     (with-current-buffer buf
+       ,@body)))
+
+(defun git-gutter:turn-on ()
+  (when (and (buffer-file-name)
+             (not (memq major-mode git-gutter:disabled-modes)))
+    (git-gutter-mode 1)))
+
+(defsubst git-gutter:turn-off ()
+  (if git-gutter-mode (git-gutter-mode -1)))
+
+;; When `define-globalized-minor-mode' is used to define `global-git-gutter-mode',
+;; `git-gutter-mode' and thus `git-gutter' get run twice when a new file is opened.
+;; (First for `fundamental-mode', then for the file-specific mode.)
+;; The following definition of `global-git-gutter-mode' avoids any redundant calls
+;; to `git-gutter'.
+
 ;;;###autoload
-(define-global-minor-mode global-git-gutter-mode
-  git-gutter-mode
-  (lambda ()
-    (when (and (buffer-file-name)
-               (not (memq major-mode git-gutter:disabled-modes)))
-      (git-gutter-mode 1)))
-  :group 'git-gutter)
+(define-minor-mode global-git-gutter-mode ()
+  "Global Git-Gutter mode"
+  :group      'git-gutter
+  :init-value nil
+  :global     t
+  (if global-git-gutter-mode
+      (progn
+        (add-hook 'find-file-hook 'git-gutter:turn-on)
+        (add-hook 'after-change-major-mode-hook 'git-gutter:reenable-buffers)
+        (git-gutter:in-all-buffers (git-gutter:turn-on)))
+    (remove-hook 'find-file-hook 'git-gutter:turn-on)
+    (remove-hook 'after-change-major-mode-hook 'git-gutter:reenable-buffers)
+    (git-gutter:in-all-buffers (git-gutter:turn-off))))
+
+(defun git-gutter:reenable-after-major-mode-change ()
+  (if global-git-gutter-mode
+      (add-to-list 'git-gutter:buffers-to-reenable (current-buffer))))
+
+(defun git-gutter:reenable-buffers ()
+  (dolist (buf git-gutter:buffers-to-reenable)
+    (with-current-buffer buf
+      (git-gutter:turn-on)))
+  (setq git-gutter:buffers-to-reenable nil))
 
 (defsubst git-gutter:show-gutter-p (diffinfos)
   (if git-gutter:hide-gutter
       (or diffinfos git-gutter:unchanged-sign)
     (or global-git-gutter-mode git-gutter:unchanged-sign diffinfos)))
 
-(defun git-gutter:show-gutter (diffinfos)
-  (when (git-gutter:show-gutter-p diffinfos)
+(defun git-gutter:show-gutter (&optional diffinfos)
+  (when (git-gutter:show-gutter-p (or diffinfos git-gutter:diffinfos))
     (let ((win-width (or git-gutter:window-width
                          (git-gutter:longest-sign-width))))
       (git-gutter:set-window-margin win-width))))
@@ -565,8 +589,7 @@ character for signs of changes"
                  (curfile (git-gutter:file-path default-directory file))
                  (diffinfos (git-gutter:diff curfile)))
             (git-gutter:update-diffinfo diffinfos)
-            (when (and git-gutter:has-indirect-buffers
-                       (not git-gutter:from-wcc-hook-p))
+            (when git-gutter:has-indirect-buffers
               (git-gutter:update-indirect-buffers file))
             (setq git-gutter:enabled t)))))))
 
